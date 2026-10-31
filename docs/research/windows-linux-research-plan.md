@@ -1,116 +1,76 @@
-# WeChat Connector: Windows mechanism audit → Linux port
+# 微信个人 Agent：Windows 机制拆解与 Linux 复刻研究计划
 
-Date: 2026-10-31
-Status: Research plan / preliminary source-backed findings (not yet end-to-end tested)
+> 日期：2026-10-31｜状态：Windows 第一轮源码审计已完成；Linux 实机尚未验证。本文及后续项目文档统一使用中文，代码标识符、API 名称与源码路径保留英文。
 
-## Goal
-First understand the actual Windows `wechatauto-replica` database-read mechanism at code level, document all reusable algorithms and version-specific assumptions, then evaluate adapting `chatlog-keeper` into a Linux-only, local, read-only WeChat connector. The first MVP is incoming-message history and incremental events; no message sending or automated login protocol.
+## 目标与边界
+先拆解 [wechatauto-replica](https://github.com/fanyuantaier/wechatauto-replica/blob/main/README.zh-CN.md) 的真实数据库读取链路，再以 [chatlog-keeper](https://github.com/labazhou2024/chatlog-keeper) 为基础，研究 Linux 官方微信的本地只读 Connector。
 
-## Sources and exact entry points
-1. Windows upstream: https://github.com/fanyuantaier/wechatauto-replica/blob/main/README.zh-CN.md
-2. Windows database engine: https://github.com/fanyuantaier/wechatauto-replica/blob/main/wechatauto/db.py
-3. Linux foundation: https://github.com/labazhou2024/chatlog-keeper/blob/main/README.zh.md
-4. Linux platform notes: https://github.com/labazhou2024/chatlog-keeper/blob/main/docs/linux.zh.md
-5. Linux memory API: https://github.com/labazhou2024/chatlog-keeper/blob/main/chatlog_keeper/core/_linux_process_memory.py
-6. Linux key flow: https://github.com/labazhou2024/chatlog-keeper/blob/main/chatlog_keeper/linux_key.py
-7. Linux scanner: https://github.com/labazhou2024/chatlog-keeper/blob/main/chatlog_keeper/scripts/linux_memory_scan.c
-8. Linux snapshot: https://github.com/labazhou2024/chatlog-keeper/blob/main/chatlog_keeper/core/_snapshot.py
+首个 MVP 仅做：本地历史消息查询、增量事件、Agent 检索接口。不做自动发消息、微信协议模拟、客户端补丁或隐蔽对抗检测。只处理账号持有者明确授权的数据；原始密钥、内存内容和聊天记录默认不上传云端。
 
-Record immutable commit SHA for each repository before implementation and cite file/line/function for all technical claims.
+## 第一阶段：Windows 机制审计
+**交付：** [windows-mechanism.md](windows-mechanism.md)
 
-## Confirmed preliminary observations (code and documentation examined)
+1. 定位微信进程和正确的账号数据目录。
+2. 分开研究两种取钥路径：`Config.Cipher` 被动内存扫描；旧版 `cfg` 主密钥恢复。不得将两者混为一谈。
+3. 研究候选密钥与数据库第一页 HMAC 验证、不同数据库的盐和逐库密钥。
+4. 研究解密缓存、密钥缓存、WAL、消息分片、发送者身份解析。
+5. 研究消息监听的轮询与增量语义，补充测试证据。
+6. 每项结论标记“源码可见 / README 声称 / 尚待实测”。
 
-### Windows implementation
-- `wechatauto/db.py` describes locating account data through config, scanning `Weixin.exe` via `OpenProcess`, `VirtualQueryEx`, `ReadProcessMemory`, verifying candidate SQLCipher keys with page-one HMAC, and decrypting to a temporary SQLite-readable cache.
-- A separate Windows *master-key* path `extract_master_key_from_cfg` finds `weixin.dll`, scans for a `global_config` landmark and follows a version-sensitive pointer chain, reads configuration key material and combines it with material extracted from a DLL instruction pattern. `derive_keys_from_master` then applies PBKDF2-HMAC-SHA512 with each database's salt and checks HMAC. The exact anchors/offsets are Windows- and version-specific and **must not be reused on Linux**.
-- `db.py` uses 4096-byte pages, a page reserve of 80 bytes (IV plus HMAC), and page-one HMAC verification. These are characteristics of the targeted build / database format, not permanent cross-version guarantees.
-- README describes multi-shard pitfalls: `(conversation, local_id)` is not globally unique; sender numerical identifiers must resolve within each shard's own `Name2Id` namespace; consumer messages should carry shard identity.
-- The Windows project also implements UI automation and even memory modification for some unrelated UI features; these components are explicitly out of scope for the read-only connector.
-- Latest examined README claims version 1.2.9 and 4.2.0.11 compatibility. This is a project claim, not independent verification by this research.
+**验收门槛：** 从进程定位到新消息事件能讲清完整链路，并能找到对应源码入口。
 
-### Linux foundation
-- `chatlog_keeper/core/_linux_process_memory.py` implements `process_vm_readv` read-only access and `/proc/<pid>/maps` parsing, with explicit permission failures.
-- `chatlog_keeper/scripts/linux_memory_scan.c` attempts `process_vm_readv` and has a `ptrace(PTRACE_ATTACH)` / `PTRACE_PEEKDATA` fallback. Thus its scanner must **not** be described as guaranteed no-debugger/no-process-interruption in every fallback path.
-- Linux documentation says Ubuntu's Yama `ptrace_scope=1` often denies passive reads of an existing unrelated process. Parent-child process topology can allow access, subject to credentials, dumpability, sandboxing and other controls.
-- Linux WeChat 4.1.13.9 x86_64 is documented as validated through a startup GDB hardware breakpoint at the internal KDF boundary, not through successful passive key scanning. LD_PRELOAD observation is an additional active path if applicable.
-- `_snapshot.py` implements bounded attempts to copy DB, `-wal`, `-shm` as a consistent family; it checks before/after file signatures and handles platform-specific fallbacks. Reuse should preserve fail-closed semantics.
+## 第二阶段：跨平台抽象
+**交付：** `portability-matrix.md`
 
-## Stage A1: Full Windows audit (deliver `docs/windows-mechanism.md`)
-1. Pin upstream commit SHA and WeChat tested versions.
-2. Trace account/process matching (avoid wrong-account database/key).
-3. Trace memory read permissions: `OpenProcess`, `VirtualQueryEx`, `ReadProcessMemory`; check every call site for write or debugger operations.
-4. Trace two key discovery paths separately: candidate SQLCipher key scan vs. master-key recovery via DLL/config object. Document exact inputs, outputs, assumptions, validation, failure modes and version dependencies.
-5. Trace cached key lifecycle: storage protection (DPAPI or possible plaintext fallback), invalidation, multi-account mapping and refresh after login/client update.
-6. Trace SQLCipher format inference, page-one HMAC, page decryption, WAL and snapshot lifecycle, corruption and checkpoint retry.
-7. Trace database schemas, message shard merge, sender resolution, stable event IDs, attachments, message edits/recalls, timestamp semantics.
-8. Trace listener: polling cadence, cursor/watermark, duplicate suppression, restart replay, data races, error reporting.
-9. Produce source map from each claim to functions and exact source lines; enumerate tests supporting each mechanism.
+| 模块 | Windows | Linux 复刻方向 |
+|---|---|---|
+| 进程发现 | `tasklist`、进程 PID | `/proc`、进程映射 |
+| 内存读取 | `OpenProcess` + `ReadProcessMemory` | `process_vm_readv` |
+| 密钥定位 | `Config.Cipher` 配置对象 | 需要重新研究 ELF/C++ 对象布局 |
+| 密钥验证 | 数据库第一页 HMAC | 优先复用算法与测试 |
+| 数据快照 | Windows 侧数据库缓存 | 复用 chatlog-keeper 快照能力 |
+| 消息解析 | 多分库、联系人映射 | 对照 Linux Schema 验证 |
+| 增量监听 | 数据库轮询 | inotify 触发 + 游标补查 |
 
-**A1 acceptance:** one reproducible end-to-end sequence diagram with function-level references; every component marked `verified in code`, `claimed by README`, or `needs runtime test`.
+## 第三阶段：Linux 基线研究
+**交付：** `linux-gap-analysis.md`
 
-## Stage A2: OS-independent contracts (deliver `docs/portability-matrix.md`)
-- `ProcessDiscovery`: process identity, account binding, binary/version information.
-- `MemoryReader`: read eligible mapped pages and distinguish `permission denied` from `no candidate`.
-- `KeyCandidateProvider`: candidate metadata only; no raw key in logs.
-- `KeyValidator`: validate candidate against target DB page one.
-- `SecretStore`: per-user encryption/permissions, key rotation, never sync private secrets.
-- `SnapshotProvider`: consistent DB/WAL snapshot or explicit retry/failure.
-- `MessageRepository`: normalized read-only cross-shard messages.
-- `IncrementalSource`: events with at-least-once delivery and persistent checkpoint.
+重点审计：
+- `chatlog_keeper/core/_linux_process_memory.py`
+- `chatlog_keeper/scripts/linux_memory_scan.c`
+- `chatlog_keeper/linux_key.py`
+- `chatlog_keeper/core/_snapshot.py`
+- `docs/linux.zh.md`
 
-Portability matrix columns: Windows source / Linux counterpart / reusable algorithm / OS-specific code / version-specific assumptions / test evidence / risk.
+**已知边界：** Ubuntu 默认 Yama 策略可能拒绝读取现有进程；C helper 存在 ptrace 回退；Linux 4.1.13.9 的已记录成功案例使用 GDB 硬件断点，不能算“纯被动扫描成功”。
 
-## Stage B1: Linux gap analysis (deliver `docs/linux-gap-analysis.md`)
-- Pin chatlog-keeper commit and inspect `linux_key.py`, `_linux_process_memory.py`, `linux_memory_scan.c`, `active_key.py`, `_snapshot.py`, `_wal.py`, relevant message parsers.
-- Verify actual passive/active control-flow and when `ptrace` or `LD_PRELOAD` can be used. Do not classify `PTRACE_PEEKDATA` fallback as purely passive.
-- Measure feature overlap with Windows: key validation, snapshot, parser, multi-shard handling, structured export, stream API.
-- Identify version-specific x86_64 memory layout and distinguish Windows MSVC objects from Linux C++ ABI structures.
+## 第四阶段：Linux 最小验证
+**交付：** `linux-poc-results.md`
 
-## Stage B2: Safe feasibility lab (deliver `docs/linux-poc-results.md`)
-- Start with a self-written fake process containing synthetic secrets to validate Linux process permissions, parent-child cases and error handling; do not modify system-wide Yama settings or run as root to bypass restrictions.
-- Test snapshot consistency and SQLCipher/HMAC algorithms on synthetic fixture DBs.
-- Only then, on an account and host the operator owns and consents to test, assess compatibility of official native Linux WeChat with a strictly bounded, read-only-only approach. Log only redacted status, never raw key, private messages or unfiltered memory dumps.
-- Distinguish three outcomes: access denied / memory accessible but key undiscoverable / key candidate found and DB HMAC validated.
-- No hooks, injections, process patching, anti-detection or protocol imitation in the first PoC. If those prove necessary, stop and revisit risk and authorization.
+先在自写模拟进程与合成数据库中验证权限、内存读取、密钥验证和快照；再在明确授权的测试账号与官方 Linux 微信上评估只读兼容性。记录“权限拒绝 / 可读取但未定位密钥 / 密钥通过 HMAC 验证”三种结果。禁止将“可读内存”误判为“已能解密微信”。
 
-**B2 gate:** Validated current target version and database with no process writes, injection or debugger attach in the selected read-only workflow. Otherwise do not claim success; consider user-initiated import/export fallback.
+不修改系统级 Yama 设置、不要求 root 绕过权限；不在第一版引入 Hook、注入、进程写入或非官方微信协议。
 
-## Stage B3: Linux read-only incremental connector
-- Prefer chatlog-keeper's existing snapshot and parser foundations; use inotify merely as a trigger, not as the source of truth.
-- Re-query shard-aware message identity and persist per-account/per-shard checkpoints; dedupe at-least-once delivery.
-- Define event payload with source account, conversation identifier, message stable ID (including shard), sender, timestamp, content type and sanitized content; never leak secrets.
-- Recover from WAL checkpoint, app restart, new shards, delayed media writes, deleted/recalled messages, crash between read and checkpoint.
-- Local socket or loopback HTTP + user permissions; default disabled cloud upload and external network exposure.
+## 第五阶段：只读增量 Connector
+**交付：** `docs/architecture/linux-connector.md`
 
-## Stage B4: Stability and deployment
-- Test across client restarts, updates, multi-account windows, app logout, rotated keys, busy WAL, large history and container permission boundaries.
-- Only after native Linux desktop proves stable evaluate headless GUI and per-user cloud isolation. Do not assume one Linux container per account works.
-- Assess platform terms, privacy/consent for counterparties, account restrictions, and licenses of reused projects.
+- 数据库及 WAL 一致性快照。
+- 按账号、消息分片、消息 ID 维护持久游标。
+- 事件至少一次投递、去重、断线补查。
+- 验证重启、checkpoint、分库新增、撤回、附件延迟写入。
+- 本地 Unix Socket 或仅 loopback API；密钥仅本地保存。
 
-## Verification checklist
-- [ ] Source revision pinned
-- [ ] Windows key paths mapped independently
-- [ ] No write/Hook path in Linux read-only MVP
-- [ ] Linux parent-child permissions measured, not assumed
-- [ ] Key candidate validated by DB HMAC
-- [ ] Multi-shard IDs and sender mappings correct
-- [ ] WAL snapshot replay/retry tests pass
-- [ ] Crash/restart sends no duplicate externally visible events
-- [ ] Keys encrypted/restricted and never logged
-- [ ] Account risk documented as unknown, not zero
-- [ ] Licensing and client policy reviewed
+## Go / No-Go 标准
+- 官方微信客户端不被修改。
+- 取钥方式、权限、版本与失败原因均有可复现记录。
+- 解密密钥经过真实目标数据库 HMAC 校验。
+- 消息不会跨账号串库；多分片身份正确。
+- 断线恢复后不漏消息、不重复对外事件。
+- 不能证明零封号风险；必须记录政策、隐私与安全边界。
 
-## Recommended working directory
-```
-wechat-personal-agent/
-  docs/research/windows-mechanism.md
-  docs/research/portability-matrix.md
-  docs/research/linux-gap-analysis.md
-  docs/research/linux-poc-results.md
-  docs/architecture/linux-connector.md
-  tests/fixtures/        # synthetic only
-  linux-connector/       # only after A1/A2 gate
-```
+## 参考源码
+- [Windows 中文 README](https://github.com/fanyuantaier/wechatauto-replica/blob/main/README.zh-CN.md)
+- [Windows 数据库引擎](https://github.com/fanyuantaier/wechatauto-replica/blob/main/wechatauto/db.py)
+- [Linux 取钥与安全模型](https://github.com/labazhou2024/chatlog-keeper/blob/main/docs/linux.zh.md)
 
-## Initial decision
-Research and reuse `chatlog-keeper` as the Linux baseline, but do not immediately fork or write production code. First resolve whether current Linux official WeChat exposes reusable, validated key material to a strictly read-only memory reader; if not, the selected constraint fails and the architecture must be reconsidered.
+> 说明：这是一份研究与验收计划，不代表 Linux 被动取钥已成功，也不代表商业部署的账号安全性已验证。
